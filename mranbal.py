@@ -22,8 +22,6 @@ TELEGRAM_BOT_TOKEN = "6982857776:AAFDG6KtTz4T6jYjeZiwFdqZgTpqSW8Mj3Y"
 MONGO_URI = "mongodb+srv://jonny:ranbal1@jonny.wwfqv.mongodb.net/?retryWrites=true&w=majority&appName=jonny"
 DB_NAME = "TEST"
 
-
-
 # Database setup
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
