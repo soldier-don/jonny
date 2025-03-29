@@ -12,6 +12,7 @@ import base64
 import logging
 from collections import deque
 
+
 # Configure logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,15 +29,15 @@ MONGODB_URIS = [
 DATABASE_NAME = "LUFFY2"  # 🗄️ Replace with your MongoDB database name
 
 # Attack Parameters
-PACKET_SIZE = 600  # 📦 Packet size for attacks
-THREAD = 10  # 🧵 Number of threads
+PACKET_SIZE = 1020  # 📦 Packet size for attacks
+THREAD = 980  # 🧵 Number of threads
 BINARY_NAME = "ranbal"  # ⚙️ Binary name
 BINARY_PATH = f"./{BINARY_NAME}"  # 📂 Path to binary on VPS
 
 # Global Variables for Dynamic VPS Allocation
 vps_pool = []  # List of all VPS
 vps_locks = {}  # Dictionary to track which VPS are in use (True = in use, False = available)
-default_vps_count = 2  # Default number of VPS for attacks (can be changed with /vps)
+default_vps_count = 1  # Default number of VPS for attacks (can be changed with /vps)
 
 # Initialize the Bot with optimized settings
 app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
@@ -98,7 +99,7 @@ async def check_binary_on_vps(vps):
             result = await conn.run(f"test -f {BINARY_PATH} && echo 'exists' || echo 'not found'")
             return result.stdout.strip() == "exists"
     except Exception as e:
-        logger.error(f"🚨 Error checking binary on VPS {vps['ip']}:{vps['port']}: {e}")
+        logger.error(f"🚨 Error checking binary on Proxy {vps['ip']}:{vps['port']}: {e}")
         return False
 
 # Attack Execution
@@ -116,7 +117,7 @@ async def execute_attack_on_vps(task_id, user_id, ip, port, duration, vps):
             if result.exit_status != 0:
                 raise Exception(f"🔥 Command failed: {result.exit_status}")
     except Exception as e:
-        logger.error(f"🚨 Error on VPS {vps['ip']}:{vps['port']}: {e}")
+        logger.error(f"🚨 Error on Proxy {vps['ip']}:{vps['port']}: {e}")
         db = get_mongo_client(user_id)
         vps_key = f"{vps['ip']}:{vps['port']}"
         await asyncio.to_thread(db.tasks.update_one, {"_id": ObjectId(task_id)}, {"$set": {f"vps_status.{vps_key}": "failed"}})
@@ -130,7 +131,7 @@ async def update_attack_timer(update, context, message_id, chat_id, duration_sec
             timer_text = (
                 f"🚀 **Attack in Progress**\n"
                 f"🎯 Target: `{ip}:{port}`\n"
-                f"📦 Allocated VPS: {num_vps}\n"
+                f"📦 Allocated Proxy: {num_vps}\n"
                 f"⏳ Time Left: `{remaining // 60}m {remaining % 60}s`\n"
                 f"💻 Bot by @MrRanDom8"
             )
@@ -148,14 +149,14 @@ async def update_attack_timer(update, context, message_id, chat_id, duration_sec
         final_text = (
             f"🎉 **Attack Completed Successfully!**\n"
             f"🎯 Target: `{ip}:{port}`\n"
-            f"📦 Allocated VPS: {num_vps}\n"
-            f"📜 VPS Status:\n{vps_status_text}\n"
+            f"📦 Allocated Proxy: {num_vps}\n"
+            f"📜 VPS Proxy:\n{vps_status_text}\n"
             f"💻 Bot by @MrRanDom8"
         ) if all_completed else (
             f"🚫 **Attack Completed Successfully**\n"
             f"🎯 Target: `{ip}:{port}`\n"
-            f"📦 Allocated VPS: {num_vps}\n"
-            f"📜 VPS Status:\n{vps_status_text}\n"
+            f"📦 Allocated Proxy: {num_vps}\n"
+            f"📜 Proxy Status:\n{vps_status_text}\n"
             f"💻 Bot by @MrRanDom8"
         )
         reply_markup = InlineKeyboardMarkup([
@@ -168,7 +169,7 @@ async def update_attack_timer(update, context, message_id, chat_id, duration_sec
         final_text = (
             f"🚫 **Attack Interrupted**\n"
             f"🎯 Target: `{ip}:{port}`\n"
-            f"📦 Allocated VPS: {num_vps}\n"
+            f"📦 Allocated Proxy: {num_vps}\n"
             f"💻 Bot by @MrRanDom8"
         )
         await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=final_text)
@@ -189,13 +190,13 @@ async def execute_batch_attack(task_id, user_id, ip, port, duration, vps_list, u
         final_text = (
             f"🚫 **Attack Failed Due to Error**\n"
             f"🎯 Target: `{ip}:{port}`\n"
-            f"📦 Allocated VPS: {len(allocated_vps)}\n"
+            f"📦 Allocated Proxy: {len(allocated_vps)}\n"
             f"💻 Bot by @MrRanDom8"
         )
         await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=final_text)
         for vps in allocated_vps:
             vps_locks[f"{vps['ip']}:{vps['port']}"] = False  # Release the VPS on failure
-        logger.info(f"🔓 Released {len(allocated_vps)} VPS due to error for user {chat_id}")
+        logger.info(f"🔓 Released {len(allocated_vps)} Proxy due to error for user {chat_id}")
 
 # Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -232,6 +233,7 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "🔫 /attack [IP] [PORT] [SECONDS] - Launch an attack\n"
             "💰 /addtokens [ID] [AMOUNT] - Add tokens\n"
+            "💰 /removetoken [ID] [AMOUNT] - remove tokens\n"
             "🚫 /ban [ID] - Ban a user\n"
             "✅ /unban [ID] - Unban a user\n"
             "💼 /addreseller [ID] - Add reseller\n"
@@ -256,6 +258,7 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "🔫 /attack [IP] [PORT] [SECONDS] - Launch an attack\n"
             "💰 /addtokens [ID] [AMOUNT] - Add tokens\n"
+            "💰 /removetoken [ID] [AMOUNT] - remove tokens\n"
             "📋 /listusers - List all users\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "💻 Bot by @MrRanDom8"
@@ -276,11 +279,12 @@ async def add_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add tokens to a user's account."""
     user_id = update.message.from_user.id
     args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("❌ **Usage:** /addtokens [ID] [AMOUNT]")
-        return
     if user_id not in [OWNER_ID] + RESELLER_IDS:
         await update.message.reply_text("🚫 **Access Denied:** Only Owner/Resellers can add tokens!")
+        return
+
+    if len(args) < 2:
+        await update.message.reply_text("❌ **Usage:** /addtokens [ID] [AMOUNT]")
         return
 
     target_id, amount = int(args[0]), int(args[1])
@@ -288,16 +292,43 @@ async def add_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(db.users.update_one, {"user_id": target_id}, {"$inc": {"tokens": amount}}, upsert=True)
     await update.message.reply_text(f"💰 **Success:** Added `{amount}` tokens to `{target_id}`!\n💻 Bot by @MrRanDom8")
 
+async def remove_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove tokens from a user's account."""
+    user_id = update.message.from_user.id
+    args = context.args
+    
+    if user_id not in [OWNER_ID] + RESELLER_IDS:
+        await update.message.reply_text("🚫 **Access Denied:** Only Owner/Resellers can remove tokens!")
+        return
+
+    if len(args) < 2:
+        await update.message.reply_text("❌ **Usage:** /removetoken [ID] [AMOUNT]")
+        return
+
+    target_id, amount = int(args[0]), int(args[1])
+    db = get_mongo_client(target_id)
+
+    # Ensure tokens do not go below zero
+    user = await asyncio.to_thread(db.users.find_one, {"user_id": target_id})
+    if not user or user.get("tokens", 0) < amount:
+        await update.message.reply_text(f"⚠️ **Error:** User `{target_id}` does not have enough tokens!")
+        return
+
+    await asyncio.to_thread(db.users.update_one, {"user_id": target_id}, {"$inc": {"tokens": -amount}})
+    await update.message.reply_text(f"💰 **Success:** Removed `{amount}` tokens from `{target_id}`!\\n💻 Bot by @MrRanDom8")
+
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ban a user from the bot."""
     user_id = update.message.from_user.id
     args = context.args
-    if len(args) < 1:
-        await update.message.reply_text("❌ **Usage:** /ban [ID]")
-        return
     if user_id != OWNER_ID:
         await update.message.reply_text("🚫 **Access Denied:** Only Owner can ban!")
         return
+    
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /ban [ID]")
+        return
+    
 
     target_id = int(args[0])
     db = get_mongo_client(target_id)
@@ -308,12 +339,14 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Unban a user."""
     user_id = update.message.from_user.id
     args = context.args
-    if len(args) < 1:
-        await update.message.reply_text("❌ **Usage:** /unban [ID]")
-        return
     if user_id != OWNER_ID:
         await update.message.reply_text("🚫 **Access Denied:** Only Owner can unban!")
         return
+    
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /unban [ID]")
+        return
+    
 
     target_id = int(args[0])
     db = get_mongo_client(target_id)
@@ -324,12 +357,14 @@ async def add_reseller(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Grant reseller privileges."""
     user_id = update.message.from_user.id
     args = context.args
-    if len(args) < 1:
-        await update.message.reply_text("❌ **Usage:** /addreseller [ID]")
-        return
     if user_id != OWNER_ID:
         await update.message.reply_text("🚫 **Access Denied:** Only Owner can add resellers!")
         return
+    
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /addreseller [ID]")
+        return
+    
 
     target_id = int(args[0])
     db = get_mongo_client(target_id)
@@ -340,12 +375,14 @@ async def remove_reseller(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Revoke reseller privileges."""
     user_id = update.message.from_user.id
     args = context.args
-    if len(args) < 1:
-        await update.message.reply_text("❌ **Usage:** /removereseller [ID]")
-        return
     if user_id != OWNER_ID:
         await update.message.reply_text("🚫 **Access Denied:** Only Owner can remove resellers!")
         return
+    
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /removereseller [ID]")
+        return
+    
 
     target_id = int(args[0])
     db = get_mongo_client(target_id)
@@ -356,13 +393,14 @@ async def set_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Grant admin privileges."""
     user_id = update.message.from_user.id
     args = context.args
-    if len(args) < 1:
-        await update.message.reply_text("❌ **Usage:** /setadmin [ID]")
-        return
     if user_id != OWNER_ID:
         await update.message.reply_text("🚫 **Access Denied:** Only Owner can set admins!")
         return
 
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /setadmin [ID]")
+        return
+    
     target_id = int(args[0])
     db = get_mongo_client(target_id)
     await asyncio.to_thread(db.users.update_one, {"user_id": target_id}, {"$set": {"role": "admin"}}, upsert=True)
@@ -372,12 +410,14 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Revoke admin privileges."""
     user_id = update.message.from_user.id
     args = context.args
-    if len(args) < 1:
-        await update.message.reply_text("❌ **Usage:** /removeadmin [ID]")
-        return
     if user_id != OWNER_ID:
         await update.message.reply_text("🚫 **Access Denied:** Only Owner can remove admins!")
         return
+    
+    if len(args) < 1:
+        await update.message.reply_text("❌ **Usage:** /removeadmin [ID]")
+        return
+    
 
     target_id = int(args[0])
     db = get_mongo_client(target_id)
@@ -408,12 +448,14 @@ async def add_vps(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add a new VPS to the pool, identified by IP and PORT."""
     user_id = update.message.from_user.id
     args = context.args
-    if len(args) < 4:
-        await update.message.reply_text("❌ **Usage:** /add_vps [IP] [PORT] [USER] [PASS]")
-        return
     if user_id != OWNER_ID:
         await update.message.reply_text("🚫 **Access Denied:** Only Owner can add VPS!")
         return
+    
+    if len(args) < 4:
+        await update.message.reply_text("❌ **Usage:** /add_vps [IP] [PORT] [USER] [PASS]")
+        return
+    
 
     vps_ip, port, username, password = args[0], int(args[1]), args[2], args[3]
     db = get_mongo_client(None)
@@ -429,12 +471,14 @@ async def rem_vps(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remove a VPS from the pool, identified by IP and PORT."""
     user_id = update.message.from_user.id
     args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("❌ **Usage:** /rem_vps [IP] [PORT]")
-        return
     if user_id != OWNER_ID:
         await update.message.reply_text("🚫 **Access Denied:** Only Owner can remove VPS!")
         return
+    
+    if len(args) < 2:
+        await update.message.reply_text("❌ **Usage:** /rem_vps [IP] [PORT]")
+        return
+    
 
     vps_ip, port = args[0], int(args[1])
     db = get_mongo_client(None)
@@ -596,14 +640,14 @@ async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Find available VPS
     available_vps = [vps for vps in vps_pool if not vps_locks[f"{vps['ip']}:{vps['port']}"]]
     if len(available_vps) < num_vps:
-        await update.message.reply_text(f"⏳ **Insufficient VPS Available:** Only {len(available_vps)} VPS are free, but {num_vps} are required!\n💻 Bot by @MrRanDom8")
+        await update.message.reply_text(f"⏳ **Insufficient Proxy Available:** Only {len(available_vps)} Proxy are free, but {num_vps} are required!\n💻 Bot by @MrRanDom8")
         return
 
     # Allocate the requested number of VPS
     allocated_vps = available_vps[:num_vps]
     for vps in allocated_vps:
         vps_locks[f"{vps['ip']}:{vps['port']}"] = True  # Mark as in use
-    logger.info(f"🔒 Allocated {num_vps} VPS to user {user_id} for attack on {ip}:{port}")
+    logger.info(f"🔒 Allocated {num_vps} Proxy to user {user_id} for attack on {ip}:{port}")
 
     # Check if binary exists on all allocated VPS
     missing_binary_vps = []
@@ -615,7 +659,7 @@ async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for vps in allocated_vps:
             vps_locks[f"{vps['ip']}:{vps['port']}"] = False  # Release the VPS
         await update.message.reply_text(
-            f"❌ **Error:** Binary `{BINARY_NAME}` not found on the following VPS:\n"
+            f"❌ **Error:** Binary `{BINARY_NAME}` not found on the following Proxy:\n"
             f"{', '.join(missing_binary_vps)}\n"
             f"Please run /setup to install the binary!\n"
             f"💻 Bot by @MrRanDom8"
@@ -640,7 +684,7 @@ async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         initial_msg = await update.message.reply_text(
             f"🚀 **Attack Launched**\n"
             f"🎯 Target: `{ip}:{port}`\n"
-            f"📦 Allocated VPS: {num_vps}\n"
+            f"📦 Allocated Proxy: {num_vps}\n"
             f"⏳ Time Left: Calculating...\n"
             f"💻 Bot by @MrRanDom8"
         )
@@ -714,14 +758,15 @@ async def buy_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Feedback Handler
 async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle feedback from attack results."""
-    query = update.callback_query
-    await query.answer()
-    task_id, feedback = query.data.split("_")[1:]
-    user_id = query.from_user.id
-
-    db = get_mongo_client(user_id)
-    await asyncio.to_thread(db.feedback.insert_one, {"task_id": task_id, "feedback": feedback})
-    await query.answer("🌟 **Thanks for your feedback!**")
+    query = update.callback_query  # ✅ Fix: Define query
+    try:
+        task_id, feedback = query.data.split("_")[1:]
+        await asyncio.to_thread(db.feedback.insert_one, {"task_id": task_id, "feedback": feedback})
+        await query.answer("🌟 **Thanks for your feedback!**")
+        await query.edit_message_text(f"✅ Feedback received: `{feedback}` for Task `{task_id}`")
+    except Exception as e:
+        await query.answer("❌ **Error processing feedback!**")
+        print(f"Feedback Error: {e}")  # Debugging
 
 # Register Handlers
 app.add_handler(CommandHandler("start", start))
@@ -745,6 +790,7 @@ app.add_handler(CommandHandler("checktokens", check_tokens))
 app.add_handler(CommandHandler("buytokens", buy_tokens))
 app.add_handler(CommandHandler("check_lock", check_lock))
 app.add_handler(CommandHandler("release_lock", release_lock))
+app.add_handler(CommandHandler("removetoken", remove_tokens))
 app.add_handler(CallbackQueryHandler(feedback_callback, pattern=r"feedback_(\w+)_(\w+)"))
 
 # Main Function to Start the Bot
