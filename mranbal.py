@@ -441,7 +441,7 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🛑 **No Users Found!**\n💻 Bot by @MrRanDom8")
         return
 
-    user_text = "\n".join([f"🆔 `{u['user_id']}` | 📛 @{u.get('username', 'Unknown')} | 🎭 {u.get('role', 'member')} | 🚦 {'🔴 Banned' if u.get('banned', 0) else '🟢 Active'}" for u in user_list])
+    user_text = "\n".join([f"🆔 `{u['user_id']}` | 📛 @{u.get('username', 'Unknown')} | 🎭 {u.get('role', 'member')} | 🚦 {'🔴 Banned' if u.get('banned', 0) else '🟢 Active'} | 💰 Tokens: {u.get('tokens', 0)}" for u in user_list])
     await update.message.reply_text(f"👥 **User List**\n━━━━━━━━━━━━━━━━━━━━━━\n{user_text}\n━━━━━━━━━━━━━━━━━━━━━━\n💻 Bot by @MrRanDom8")
 
 async def add_vps(update: Update, context: ContextTypes.DEFAULT_TYPE):
