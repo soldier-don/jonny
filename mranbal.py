@@ -29,7 +29,7 @@ MONGODB_URIS = [
 DATABASE_NAME = "LUFFY2"  # 🗄️ Replace with your MongoDB database name
 
 # Attack Parameters
-PACKET_SIZE = 1020  # 📦 Packet size for attacks
+PACKET_SIZE = 1011  # 📦 Packet size for attacks
 THREAD = 980  # 🧵 Number of threads
 BINARY_NAME = "ranbal"  # ⚙️ Binary name
 BINARY_PATH = f"./{BINARY_NAME}"  # 📂 Path to binary on VPS
